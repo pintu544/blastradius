@@ -1,0 +1,24 @@
+# Local dev stack. Production deploy (Render/Railway + Vercel) happens during the event.
+services:
+  falkordb:
+    image: falkordb/falkordb:latest
+    ports:
+      - "6379:6379" # graph / redis protocol
+      - "3000:3000" # FalkorDB browser UI
+    volumes:
+      - falkordb-data:/data
+    restart: unless-stopped
+
+  server:
+    build: ./server
+    ports:
+      - "4000:4000"
+    env_file:
+      - ./server/.env # create from server/.env.example; never commit
+    environment:
+      FALKORDB_URL: redis://falkordb:6379
+    depends_on:
+      - falkordb
+
+volumes:
+  falkordb-data:
