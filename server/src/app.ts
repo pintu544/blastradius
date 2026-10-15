@@ -12,6 +12,7 @@
 //   GET  /api/ask?repo=&q=              ("what breaks if I change X?")
 
 import express from 'express';
+import cors from 'cors';
 import {
   blast_radius,
   impact_rank,
@@ -116,6 +117,9 @@ function shortName(fn: GraphNode): string {
 
 export function createApp(): express.Express {
   const app = express();
+  // The UI is served from a different origin (Vercel) than the API
+  // (Render) — without CORS the browser blocks every API call.
+  app.use(cors());
   app.use(express.json({ limit: '64kb' }));
 
   app.get('/health', (_req, res) => {

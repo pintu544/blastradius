@@ -144,3 +144,22 @@ describe('GET /api/ask', () => {
     expect(String(res.body.match.name).toLowerCase()).toContain('login');
   });
 });
+
+describe('CORS', () => {
+  it('sends Access-Control-Allow-Origin on API responses', async () => {
+    const res = await request(app)
+      .get('/api/stats?repo=vuln-demo')
+      .set('Origin', 'https://blastradius-eosin.vercel.app');
+    expect(res.status).toBe(200);
+    expect(res.headers['access-control-allow-origin']).toBe('*');
+  });
+
+  it('answers preflight OPTIONS requests', async () => {
+    const res = await request(app)
+      .options('/api/scan')
+      .set('Origin', 'https://blastradius-eosin.vercel.app')
+      .set('Access-Control-Request-Method', 'POST');
+    expect(res.status).toBe(204);
+    expect(res.headers['access-control-allow-origin']).toBe('*');
+  });
+});
