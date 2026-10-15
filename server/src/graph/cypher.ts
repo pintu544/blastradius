@@ -23,6 +23,7 @@ import {
   type GraphEdge,
   type GraphNode,
   type GraphStats,
+  type NodeLabel,
 } from './types.js';
 import type * as net from 'node:net';
 
@@ -193,12 +194,43 @@ async function probeEndpoint(
 // Minimal structural typing for the driver pieces we use, so the module
 // loads without the driver installed until connect() is actually called.
 interface DriverGraph {
-  query(cypher: string, options?: { params?: Record<string, unknown> }): Promise<unknown>;
+  query(
+    cypher: string,
+    options?: { params?: Record<string, unknown> },
+  ): Promise<unknown>;
 }
 interface DriverClient {
   selectGraph(graphId: string): DriverGraph;
   close(): Promise<void>;
   on(event: 'error', listener: (err: unknown) => void): void;
+}
+
+/**
+ * Map one driver-parsed node value to our GraphNode. Shape grounded in the
+ * driver's #parseNode: `{ id, labels, properties }`. Our writes always store
+ * the logical node id in `properties.id`, so prefer that.
+ */
+function mapDriverNode(value: unknown): GraphNode | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const v = value as { id?: unknown; labels?: unknown; properties?: unknown };
+  if (!Array.isArray(v.labels) || typeof v.labels[0] !== 'string') return undefined;
+  const props = (v.properties ?? {}) as Record<string, unknown>;
+  const id = typeof props['id'] === 'string' ? (props['id'] as string) : String(v.id ?? '');
+  if (!id) return undefined;
+  const clean: Record<string, string | number | boolean | string[]> = {};
+  for (const [k, val] of Object.entries(props)) {
+    if (
+      typeof val === 'string' ||
+      typeof val === 'number' ||
+      typeof val === 'boolean' ||
+      (Array.isArray(val) && val.every((x) => typeof x === 'string'))
+    ) {
+      clean[k] = val as string | number | boolean | string[];
+    } else {
+      clean[k] = String(val);
+    }
+  }
+  return { id, label: v.labels[0] as GraphNode['label'], props: clean };
 }
 
 export class CypherGraphStore implements GraphStore {
@@ -315,13 +347,59 @@ export class CypherGraphStore implements GraphStore {
     this.edgeCounts.set(edge.type, (this.edgeCounts.get(edge.type) ?? 0) + 1);
   }
 
-  async getNode(_id: string): Promise<GraphNode | undefined> {
-    // Read-back queries arrive on Day 2 with the agent tools.
-    throw new Error('CypherGraphStore.getNode is not implemented until live reads are wired (Day 2)');
+  async getNode(id: string): Promise<GraphNode | undefined> {
+    const rows = await this.readQuery('MATCH (n {id: $id}) RETURN n', { id });
+    const node = rows.map((r) => mapDriverNode((r as Record<string, unknown>)['n']))[0];
+    return node;
   }
 
-  async neighbors(_id: string, _opts?: NeighborsOptions): Promise<GraphNode[]> {
-    throw new Error('CypherGraphStore.neighbors is not implemented until live reads are wired (Day 2)');
+  async neighbors(id: string, opts: NeighborsOptions = {}): Promise<GraphNode[]> {
+    const { type, direction = 'both' } = opts;
+    // Labels / relationship types come from our own fixed enums, so
+    // interpolating them into the statement text is safe; ids are params.
+    const rel = type ? `:\`${type}\`` : '';
+    const patterns = {
+      out: `(a {id: $id})-[r${rel}]->(b)`,
+      in: `(a {id: $id})<-[r${rel}]-(b)`,
+      both: `(a {id: $id})-[r${rel}]-(b)`,
+    } as const;
+    const rows = await this.readQuery(`MATCH ${patterns[direction]} RETURN b`, { id });
+    return rows
+      .map((r) => mapDriverNode((r as Record<string, unknown>)['b']))
+      .filter((n): n is GraphNode => n !== undefined);
+  }
+
+  async findNodes(label: NodeLabel): Promise<GraphNode[]> {
+    const rows = await this.readQuery(`MATCH (n:\`${label}\`) RETURN n`);
+    return rows
+      .map((r) => mapDriverNode((r as Record<string, unknown>)['n']))
+      .filter((n): n is GraphNode => n !== undefined);
+  }
+
+  /**
+   * Execute a read-only Cypher statement against the live graph and return
+   * the parsed rows (objects keyed by RETURN alias). Throws when not
+   * connected — callers fall back or surface a clear message, never crash.
+   *
+   * Row mapping is grounded in the `falkordb` driver's own reply parsing
+   * (node_modules/falkordb/dist/src/graph.js #parseNode): `query()` returns
+   * rows of `{ [alias]: { id, labels, properties } }`.
+   */
+  async readQuery(
+    cypher: string,
+    params: Record<string, unknown> = {},
+  ): Promise<Record<string, unknown>[]> {
+    if (!this.graph) {
+      throw new Error(
+        'CypherGraphStore is not connected to FalkorDB — live reads need FALKORDB_URL and a reachable server',
+      );
+    }
+    const reply = (await this.graph.query(cypher, { params })) as {
+      data?: Record<string, unknown>[];
+    };
+    // Note: reads are deliberately NOT recorded in `statements` — that array
+    // is the unit-testable record of *writes*.
+    return reply.data ?? [];
   }
 
   /** Stats derived from generated statements — works with or without a live server. */
@@ -333,12 +411,18 @@ export class CypherGraphStore implements GraphStore {
     s.imports = this.nodeCounts.get('Import') ?? 0;
     s.commits = this.nodeCounts.get('Commit') ?? 0;
     s.authors = this.nodeCounts.get('Author') ?? 0;
+    s.findings = this.nodeCounts.get('Finding') ?? 0;
+    s.sessions = this.nodeCounts.get('Session') ?? 0;
+    s.notes = this.nodeCounts.get('Note') ?? 0;
     s.callsEdges = this.edgeCounts.get('CALLS') ?? 0;
     s.importsEdges = this.edgeCounts.get('IMPORTS') ?? 0;
     s.definesEdges = this.edgeCounts.get('DEFINES') ?? 0;
     s.touchedEdges = this.edgeCounts.get('TOUCHED') ?? 0;
     s.ownsEdges = this.edgeCounts.get('OWNS') ?? 0;
     s.authoredEdges = this.edgeCounts.get('AUTHORED') ?? 0;
+    s.flaggedInEdges = this.edgeCounts.get('FLAGGED_IN') ?? 0;
+    s.reachesEdges = this.edgeCounts.get('REACHES') ?? 0;
+    s.remembersEdges = this.edgeCounts.get('REMEMBERS') ?? 0;
     return s;
   }
 

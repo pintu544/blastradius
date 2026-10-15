@@ -10,9 +10,9 @@ import { execFile } from 'node:child_process';
 import { existsSync, promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { createGraphStore } from '../graph/factory.js';
+import { writeSnapshot } from '../graph/snapshot.js';
 import type { GraphStore } from '../graph/store.js';
 import {
   emptyStats,
@@ -21,6 +21,7 @@ import {
   type GraphSnapshot,
   type GraphStats,
 } from '../graph/types.js';
+import { analyzeGraph } from '../detect/analyze.js';
 import { authorNodeId, commitNodeId, deriveOwners, readGitHistory } from './git.js';
 import { languageForExtension, parseSource, type ParsedFile } from './parser.js';
 import {
@@ -33,9 +34,6 @@ import {
 
 const execFileAsync = promisify(execFile);
 
-const SERVER_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const SCAN_CACHE_DIR = path.join(SERVER_ROOT, '.scan-cache');
-
 const SKIP_DIRS = new Set([
   '.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.turbo', 'vendor',
 ]);
@@ -45,6 +43,10 @@ export interface ScanOptions {
   store?: GraphStore;
   /** Attempt a live FalkorDB connection when FALKORDB_URL is set (default true). */
   live?: boolean;
+  /** Run Day 2 detection + memory analysis after ingestion (default false). */
+  analyze?: boolean;
+  /** Previous snapshot for carrying finding statuses / notes across runs. */
+  previousSnapshot?: GraphSnapshot | null;
   maxCommits?: number;
   onLog?: (msg: string) => void;
 }
@@ -153,6 +155,7 @@ export async function scanRepo(target: string, opts: ScanOptions = {}): Promise<
     // --- 1. Parse files ---------------------------------------------------
     const absFiles = await listCodeFiles(workDir, log);
     const parsed: ParsedFile[] = [];
+    const sources = new Map<string, string>();
     for (const abs of absFiles) {
       const rel = path.relative(workDir, abs).split(path.sep).join(path.posix.sep);
       let source: string;
@@ -167,6 +170,7 @@ export async function scanRepo(target: string, opts: ScanOptions = {}): Promise<
       try {
         const pf = await parseSource(source, rel, lang);
         parsed.push(pf);
+        sources.set(rel, source);
       } catch (err) {
         log(`  parse warning: ${rel}: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -279,7 +283,19 @@ export async function scanRepo(target: string, opts: ScanOptions = {}): Promise<
     const finalStats = await store.stats();
     Object.assign(stats, finalStats);
 
-    // --- 4. Snapshot for the API ------------------------------------------
+    // --- 4. Detection + memory (Day 2) -------------------------------------
+    if (opts.analyze) {
+      log('Running detection rules ...');
+      await analyzeGraph(
+        parsed,
+        sources,
+        { store, putNode, putEdge, onLog: log },
+        { repo, previous: opts.previousSnapshot ?? null },
+      );
+      Object.assign(stats, await store.stats());
+    }
+
+    // --- 5. Snapshot for the API ------------------------------------------
     const snapshot: GraphSnapshot = {
       repo,
       scannedAt: new Date().toISOString(),
@@ -287,9 +303,7 @@ export async function scanRepo(target: string, opts: ScanOptions = {}): Promise<
       nodes,
       edges,
     };
-    await fs.mkdir(SCAN_CACHE_DIR, { recursive: true });
-    const snapshotPath = path.join(SCAN_CACHE_DIR, `${repo}.json`);
-    await fs.writeFile(snapshotPath, JSON.stringify(snapshot));
+    const snapshotPath = await writeSnapshot(snapshot);
     log(`Snapshot written to ${snapshotPath}`);
 
     await store.close();

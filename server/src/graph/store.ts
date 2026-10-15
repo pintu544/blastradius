@@ -11,7 +11,7 @@
 // here. The Cypher statements it generates are real and unit-tested; the
 // in-memory store proves the graph model end to end.
 
-import type { EdgeType, GraphEdge, GraphNode, GraphStats } from './types.js';
+import type { EdgeType, GraphEdge, GraphNode, GraphStats, NodeLabel } from './types.js';
 
 export interface NeighborsOptions {
   type?: EdgeType;
@@ -26,6 +26,8 @@ export interface GraphStore {
 
   getNode(id: string): Promise<GraphNode | undefined>;
   neighbors(id: string, opts?: NeighborsOptions): Promise<GraphNode[]>;
+  /** All nodes with the given label (Day 2: findings, notes, sessions). */
+  findNodes(label: NodeLabel): Promise<GraphNode[]>;
   stats(): Promise<GraphStats>;
 
   close(): Promise<void>;

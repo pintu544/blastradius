@@ -9,6 +9,7 @@ import {
   type GraphEdge,
   type GraphNode,
   type GraphStats,
+  type NodeLabel,
 } from './types.js';
 
 const EDGE_KEY = (e: GraphEdge) => `${e.from}\u0000${e.to}\u0000${e.type}`;
@@ -53,6 +54,14 @@ export class InMemoryGraphStore implements GraphStore {
     return this.nodes.get(id);
   }
 
+  async findNodes(label: NodeLabel): Promise<GraphNode[]> {
+    const out: GraphNode[] = [];
+    for (const node of this.nodes.values()) {
+      if (node.label === label) out.push(node);
+    }
+    return out;
+  }
+
   async neighbors(id: string, opts: NeighborsOptions = {}): Promise<GraphNode[]> {
     const { type, direction = 'both' } = opts;
     const keys = new Set<string>();
@@ -84,6 +93,9 @@ export class InMemoryGraphStore implements GraphStore {
         case 'Import': s.imports++; break;
         case 'Commit': s.commits++; break;
         case 'Author': s.authors++; break;
+        case 'Finding': s.findings++; break;
+        case 'Session': s.sessions++; break;
+        case 'Note': s.notes++; break;
       }
     }
     for (const edge of this.edges.values()) {
@@ -94,6 +106,9 @@ export class InMemoryGraphStore implements GraphStore {
         TOUCHED: 'touchedEdges',
         OWNS: 'ownsEdges',
         AUTHORED: 'authoredEdges',
+        FLAGGED_IN: 'flaggedInEdges',
+        REACHES: 'reachesEdges',
+        REMEMBERS: 'remembersEdges',
       };
       s[counter[edge.type]]++;
     }
