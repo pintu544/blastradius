@@ -137,8 +137,28 @@ describe('CypherGraphStore', () => {
   it('never echoes the URL in parse errors (may contain credentials)', async () => {
     const store = new CypherGraphStore('demo', 'https://user:secret@example.com/db');
     await expect(store.connect()).rejects.toThrow(
-      'FALKORDB_URL must be a redis://, falkor:// or rediss:// URL',
+      'FALKORDB_URL must be a redis://, falkor://, rediss:// or falkors:// URL',
     );
     await expect(store.connect()).rejects.not.toThrow('secret');
+  });
+
+  it('does not crash when the endpoint speaks garbage (probe rejects first)', async () => {
+    // Regression test: previously the driver's forwarded 'error' event for a
+    // non-RESP endpoint became an *unhandled 'error' event* and killed the
+    // whole process. The probe must reject cleanly instead.
+    const { createServer } = await import('node:net');
+    const server = createServer((socket) => {
+      socket.write('mystery-garbage\r\n');
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as import('node:net').AddressInfo).port;
+    try {
+      const store = new CypherGraphStore('demo', `redis://127.0.0.1:${port}`);
+      await expect(store.connect()).rejects.toThrow('did not answer a RESP PING');
+      expect(store.connected).toBe(false);
+      // If we get here, the process survived — the regression is fixed.
+    } finally {
+      server.close();
+    }
   });
 });

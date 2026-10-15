@@ -31,6 +31,9 @@ export async function createGraphStore(
     opts.onLog?.(`Connected to FalkorDB (${cypher.graphName}) — writing live.`);
     return { store: cypher, kind: 'cypher', fallbackWarning: null };
   } catch (err) {
+    // Release any half-open client so it can't emit a late 'error' event
+    // after we've already fallen back.
+    await cypher.abort();
     const reason = err instanceof Error ? err.message : String(err);
     // Deliberately NOT echoing the URL: it may contain credentials.
     const warning =

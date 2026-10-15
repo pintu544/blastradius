@@ -24,6 +24,7 @@ import {
   type GraphNode,
   type GraphStats,
 } from './types.js';
+import type * as net from 'node:net';
 
 export interface CypherStatement {
   cypher: string;
@@ -48,13 +49,145 @@ function sanitizeGraphName(name: string): string {
   return `blastradius_${slug || 'repo'}`;
 }
 
-function parseConnectionUrl(url: string): { host: string; port: number; tls: boolean } {
-  // Accept redis:// (standard), falkor:// (FalkorDB Cloud dashboard format —
-  // same RESP protocol underneath), and rediss:// (TLS).
+function parseConnectionUrl(url: string): {
+  host: string;
+  port: number;
+  tls: boolean;
+  password: string | null;
+} {
+  // Accept redis://, falkor:// (FalkorDB Cloud dashboard format — the driver
+  // itself documents falkor[s]:// URLs and rewrites them to redis[s]://),
+  // and rediss:// / falkors:// (TLS).
   // The URL itself is never echoed in errors: it may contain credentials.
-  const m = /^(redis|falkor|rediss):\/\/(?:[^@]*@)?([^:/]+)(?::(\d+))?/.exec(url);
-  if (!m) throw new Error('FALKORDB_URL must be a redis://, falkor:// or rediss:// URL');
-  return { host: m[2], port: m[3] ? Number(m[3]) : 6379, tls: m[1] === 'rediss' };
+  const m = /^(redis|falkor|rediss|falkors):\/\/(?:([^:@]*)(?::([^@]*))?@)?([^:/]+)(?::(\d+))?/.exec(url);
+  if (!m) {
+    throw new Error('FALKORDB_URL must be a redis://, falkor://, rediss:// or falkors:// URL');
+  }
+  const scheme = m[1];
+  return {
+    host: m[4],
+    port: m[5] ? Number(m[5]) : 6379,
+    tls: scheme === 'rediss' || scheme === 'falkors',
+    password: m[3] ?? null,
+  };
+}
+
+function rejectAfter<T>(ms: number, message: string): Promise<T> {
+  return new Promise<T>((_, reject) => {
+    const t = setTimeout(() => reject(new Error(message)), ms);
+    // Don't let a stray timer keep the process alive after the race settles.
+    (t as unknown as { unref?: () => void }).unref?.();
+  });
+}
+
+/**
+ * Speak just enough RESP to prove the endpoint is a Redis/FalkorDB server:
+ * optional AUTH, then PING expecting +PONG. Rejects on timeouts, TCP errors,
+ * auth failures, or non-RESP chatter. Fully self-contained (own socket, own
+ * handlers) so a hostile endpoint can never crash the process.
+ */
+async function probeEndpoint(
+  host: string,
+  port: number,
+  tls: boolean,
+  password: string | null,
+  timeoutMs = 5000,
+): Promise<void> {
+  const netMod = await import('node:net');
+  const tlsMod = tls ? await import('node:tls') : null;
+
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let stage: 'auth' | 'ping' = password ? 'auth' : 'ping';
+    let buffer = '';
+    let socket: net.Socket | null = null;
+
+    const done = (err?: Error): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (socket) {
+        try {
+          socket.removeAllListeners();
+          socket.destroy();
+        } catch {
+          /* ignore */
+        }
+        socket = null;
+      }
+      if (err) reject(err);
+      else resolve();
+    };
+    const timer = setTimeout(
+      () => done(new Error(`endpoint probe timed out after ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+    (timer as unknown as { unref?: () => void }).unref?.();
+
+    const writeLine = (line: string): void => {
+      try {
+        socket?.write(line);
+      } catch (err) {
+        done(err instanceof Error ? err : new Error(String(err)));
+      }
+    };
+    const sendAuthOrPing = (): void => {
+      if (password) {
+        const p = Buffer.from(password, 'utf8');
+        writeLine(`*2\r\n$4\r\nAUTH\r\n$${p.length}\r\n${password}\r\n`);
+      } else {
+        writeLine('PING\r\n');
+      }
+    };
+
+    const pump = (): void => {
+      let idx: number;
+      while ((idx = buffer.indexOf('\r\n')) >= 0) {
+        const line = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        if (stage === 'auth') {
+          if (line.startsWith('+OK')) {
+            stage = 'ping';
+            writeLine('PING\r\n');
+          } else {
+            done(new Error(`endpoint rejected AUTH (${line.slice(0, 40)})`));
+            return;
+          }
+        } else if (line.startsWith('+PONG')) {
+          done();
+          return;
+        } else {
+          done(new Error('endpoint did not answer a RESP PING (not a Redis/FalkorDB server?)'));
+          return;
+        }
+      }
+    };
+
+    try {
+      if (tls && tlsMod) {
+        const s = tlsMod.connect({ host, port, servername: host, timeout: timeoutMs });
+        socket = s;
+        s.on('secureConnect', sendAuthOrPing);
+      } else {
+        const s = netMod.connect(port, host);
+        socket = s;
+        s.setTimeout(timeoutMs);
+        s.on('connect', sendAuthOrPing);
+        s.on('timeout', () => done(new Error(`endpoint probe timed out after ${timeoutMs}ms`)));
+      }
+      socket.on('error', (err: Error) => done(err));
+      socket.on('data', (chunk: Buffer) => {
+        buffer += chunk.toString('utf8');
+        if (buffer.length > 4096) {
+          done(new Error('endpoint sent unexpected data during probe'));
+          return;
+        }
+        pump();
+      });
+    } catch (err) {
+      done(err instanceof Error ? err : new Error(String(err)));
+    }
+  });
 }
 
 // Minimal structural typing for the driver pieces we use, so the module
@@ -65,6 +198,7 @@ interface DriverGraph {
 interface DriverClient {
   selectGraph(graphId: string): DriverGraph;
   close(): Promise<void>;
+  on(event: 'error', listener: (err: unknown) => void): void;
 }
 
 export class CypherGraphStore implements GraphStore {
@@ -83,24 +217,77 @@ export class CypherGraphStore implements GraphStore {
     this.graphName = sanitizeGraphName(repoName);
   }
 
-  /** Attempt a live connection. Throws when FALKORDB_URL is unset or unreachable. */
+  /**
+   * Attempt a live connection. Throws when FALKORDB_URL is unset or the
+   * endpoint is unreachable — but NEVER crashes the process. Three layers:
+   *   1. Probe the endpoint with our own socket first (AUTH/PING). The
+   *      driver's FalkorDB.connect() forwards redis 'error' events to the
+   *      instance, which becomes an *unhandled 'error' event* (process
+   *      crash) when the endpoint speaks garbage and no listener exists
+   *      yet. The probe keeps us away from the driver in that case.
+   *   2. A scoped uncaughtException guard + timeouts around the driver's
+   *      connect, covering the residual window where its error forwarding
+   *      could fire before we can attach our listener.
+   *   3. An 'error' listener attached synchronously after connect resolves,
+   *      so later async failures surface via query() rejections, not crashes.
+   */
   async connect(): Promise<void> {
     if (!this.url) throw new Error('FALKORDB_URL is not set — cannot connect to FalkorDB');
-    const { host, port, tls } = parseConnectionUrl(this.url);
+    const { host, port, tls, password } = parseConnectionUrl(this.url);
+
+    await probeEndpoint(host, port, tls, password);
+
     // Dynamic import: the driver is only required when a live connection is attempted.
     const { FalkorDB } = (await import('falkordb')) as {
       FalkorDB: {
         connect(options?: unknown): Promise<DriverClient>;
       };
     };
-    this.client = await FalkorDB.connect({
-      socket: { host, port, ...(tls ? { tls: true } : {}) },
-      connectTimeout: 5000,
+
+    let strayError: unknown = null;
+    const strayHandler = (err: unknown): void => {
+      if (strayError === null) strayError = err;
+    };
+    process.on('uncaughtException', strayHandler);
+    let client: DriverClient;
+    try {
+      // If the race settles first, the driver's late rejection must not
+      // become an unhandled rejection (Node crashes on those by default).
+      const attempt = FalkorDB.connect({ url: this.url });
+      attempt.catch(() => {});
+      client = await Promise.race([attempt, rejectAfter<DriverClient>(12000, 'FalkorDB driver connect timed out')]);
+    } finally {
+      process.removeListener('uncaughtException', strayHandler);
+    }
+    if (strayError !== null) {
+      throw strayError instanceof Error ? strayError : new Error(String(strayError));
+    }
+
+    client.on('error', () => {
+      /* swallowed: post-connect failures surface via query()/close() rejections */
     });
-    this.graph = this.client.selectGraph(this.graphName);
-    // Smoke test so a half-open socket fails fast instead of mid-scan.
-    await this.graph.query('RETURN 1');
+    this.client = client;
+    this.graph = client.selectGraph(this.graphName);
+    // Bounded smoke test so a half-open connection fails fast instead of mid-scan.
+    const smoke = this.graph.query('RETURN 1');
+    smoke.catch(() => {});
+    await Promise.race([smoke, rejectAfter<unknown>(8000, 'FalkorDB smoke query timed out')]);
     this.connected = true;
+  }
+
+  /** Quietly release a half-open client after a failed attempt. Never throws. */
+  async abort(): Promise<void> {
+    if (this.client) {
+      try {
+        this.client.on('error', () => {});
+        await this.client.close();
+      } catch {
+        /* ignore */
+      }
+      this.client = null;
+      this.graph = null;
+      this.connected = false;
+    }
   }
 
   private async exec(stmt: CypherStatement): Promise<void> {
