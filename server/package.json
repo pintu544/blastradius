@@ -7,10 +7,12 @@
     "tree-sitter-typescript": "^0.23.2",
     "web-tree-sitter": "^0.27.1"
   },
-  "description": "BlastRadius API server \u2014 Graph Hacks 2026 entry (build starts Oct 15)",
+  "description": "BlastRadius API server — Graph Hacks 2026 entry (build starts Oct 15)",
   "devDependencies": {
     "@types/express": "^4.17.21",
     "@types/node": "^24.19.2",
+    "@types/supertest": "^7.2.1",
+    "supertest": "^7.3.1",
     "tsx": "^4.16.0",
     "typescript": "^5.5.0",
     "vitest": "^5.0.4"
