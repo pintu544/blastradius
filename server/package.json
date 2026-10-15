@@ -1,1 +1,32 @@
-{"dependencies":{"express":"^4.19.2"},"description":"BlastRadius API server — Graph Hacks 2026 entry (build starts Oct 15)","devDependencies":{"@types/express":"^4.17.21","@types/node":"^20.14.0","tsx":"^4.16.0","typescript":"^5.5.0"},"engines":{"node":">=20"},"name":"blastradius-server","private":true,"scripts":{"build":"tsc","dev":"tsx watch src/index.ts","start":"node dist/index.js"},"type":"module","version":"0.1.0"}
+{
+  "dependencies": {
+    "dotenv": "^18.0.8",
+    "express": "^4.19.2",
+    "falkordb": "^6.8.0",
+    "tree-sitter-javascript": "^0.25.0",
+    "tree-sitter-typescript": "^0.23.2",
+    "web-tree-sitter": "^0.27.1"
+  },
+  "description": "BlastRadius API server \u2014 Graph Hacks 2026 entry (build starts Oct 15)",
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^24.19.2",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0",
+    "vitest": "^5.0.4"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "name": "blastradius-server",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "dev": "node node_modules/tsx/dist/cli.mjs watch src/index.ts",
+    "start": "node dist/index.js",
+    "scan": "node node_modules/tsx/dist/cli.mjs src/scan.ts",
+    "test": "node node_modules/vitest/vitest.mjs run"
+  },
+  "type": "module",
+  "version": "0.1.0"
+}
